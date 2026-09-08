@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 import inspect as _inspect
+import os as _os
+
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
@@ -895,6 +897,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert long_seq_args is not None
             _, ori_token_indices_to_sample = long_seq_args
 
+        _pf_state = getattr(common_attn_metadata, "attn_state", None)
+        if (
+            self.method == "mtp"
+            and (
+                num_prefill_reqs > 0
+                or _pf_state
+                in (
+                    AscendAttentionState.PrefillNoCache,
+                    AscendAttentionState.PrefillCacheHit,
+                    AscendAttentionState.ChunkedPrefill,
+                )
+            )
+            and getattr(self, "dcp_size", 1) == 1
+            and not self.uses_mrope
+        ):
+            self._mtp_draft_prefill(common_attn_metadata, num_tokens)
+
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         uniform_decode = target_model_batch_desc.uniform
 
@@ -1435,15 +1454,68 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             positions = self.positions[token_indices_to_sample]
         hidden_states = hidden_states[token_indices_to_sample]
+        _mtp_tis_vec = token_indices_to_sample.detach().clone()
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+        if self.method == "mtp" and not self.use_cuda_graph:
+            # Eager MTP: the per-step attn metadata built by
+            # attn_update_stack_num_spec_norm describes a batch_size x 1 decode
+            # batch (qsl=arange[:batch_size+1], num_actual_tokens=batch_size),
+            # so the loop must run only the per-request chain rows. Using
+            # num_input_tokens here feeds stale window rows (frozen tokens at
+            # old positions with stale hiddens) through the MTP layer.
+            input_batch_size = batch_size
+        else:
+            input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
 
-        for draft_index in range(self.num_speculative_tokens - 1):
+        _mtp_rerun = self.method == "mtp" and not self.use_cuda_graph
+        if _mtp_rerun:
+            # Eager MTP: draft d2..dk by re-running the whole window through
+            # the already-verified spec forward path. Each rerun plants the
+            # previous draft token into the next chain row (row tis+j, which
+            # sits at position s+j+1) paired with the target hidden from row
+            # tis (h_{s+1}: hidden of the last committed token) -- the only
+            # true target-style hidden available at draft time. Feeding the
+            # MTP layer's own output hidden back (raw or shared_head.norm'd)
+            # is out-of-distribution for this model, which is trained to
+            # consume a target hidden per MTP call. The next draft is sampled
+            # from the planted row's output.
+            _fctx = get_forward_context()
+            _tis_long = _mtp_tis_vec.long()
+            for _j in range(1, self.num_speculative_tokens):
+                _rows = (_mtp_tis_vec + _j).long()
+                if bool((_rows >= num_input_tokens).any()):
+                    break
+                self.input_ids[_rows] = draft_token_ids_tensor[_j - 1][: _rows.shape[0]].to(self.input_ids.dtype)
+                self.hidden_states[_rows] = self.hidden_states[_tis_long]
+                _ids = self.input_ids[:num_input_tokens]
+                _pos = self._get_positions(num_input_tokens)
+                _hid = self.hidden_states[:num_input_tokens]
+                _kw = {"input_ids": _ids, "positions": _pos, "inputs_embeds": inputs_embeds}
+                if self.pass_hidden_states_to_model:
+                    _hid2, _pos2 = self.maybe_pad_and_reduce(_hid, _pos)
+                    _kw["hidden_states"] = _hid2
+                    if self.method == "mtp":
+                        _kw["positions"] = _pos2
+                if _fctx is not None and multi_steps_attn_metadata:
+                    _fctx.attn_metadata = multi_steps_attn_metadata[0]
+                    _fctx.moe_layer_index = 0
+                _dm = getattr(self.model, "model", None)
+                if self._share_mtp_indices and _dm is not None and hasattr(_dm, "set_skip_topk"):
+                    _dm.set_skip_topk(False)
+                _ret = self.model(**_kw)
+                _lh, _ = _split_draft_outputs(_ret)
+                _lh, _, _ = self.maybe_all_gather_and_unpad(
+                    _lh, _kw["positions"], _lh
+                )
+                _h_fb = _lh[_rows]
+                _dj, _ = self.compute_draft_token_ids(_h_fb, sampling_metadata)
+                draft_token_ids_tensor[_j] = _dj[: _rows.shape[0]]
+        for draft_index in ([] if _mtp_rerun else range(self.num_speculative_tokens - 1)):
             # Reset MOE layer index for each draft step iteration
             forward_context = get_forward_context()
             if forward_context is not None:
@@ -1510,7 +1582,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             ret_hidden_states = self.model(**model_kwargs)
             last_hidden_states, hidden_states = _split_draft_outputs(ret_hidden_states)
-
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
                 last_hidden_states, model_positions, hidden_states
             )
@@ -1590,7 +1661,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Inserting the next token ids at the last slot in each request.
             if token_indices_to_sample is None:
                 token_indices_to_sample = cad.query_start_loc[1:] - 1
-
             num_tokens = target_token_ids.shape[0]
             # Shift the input ids by one token.
             # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
@@ -1757,6 +1827,70 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
         return self.method not in ("mtp", "draft_model", "dflash", "dspark")
 
+    def _mtp_draft_prefill(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_tokens: int,
+    ) -> None:
+        """Populate the MTP layer's KV cache for prompt positions.
+
+        Without this pass the draft layer's KV cache only ever contained the
+        positions processed by decode-round draft steps, so draft attention
+        read uninitialized KV for all prompt positions and speculation
+        collapsed beyond position 1. Runs the draft layer once over the
+        whole scheduled batch of a prefill round: the one-position-shifted
+        token stream already prepared by ``set_inputs_first_pass`` (slot i
+        holds token t_{i+1}, paired with the target hidden at position i,
+        per the DeepSeek-MTP input convention) writes draft KV for every
+        scheduled slot. Outputs are discarded; the merged-draft flow then
+        reprocesses the last position to emit draft token 0 as usual.
+        """
+        from vllm.forward_context import set_forward_context
+
+        num_reqs = common_attn_metadata.num_reqs
+        gid = self.draft_attn_groups[0].kv_cache_group_id
+        common = self.shallow_copy_metadata(common_attn_metadata)
+        common.num_actual_tokens = num_tokens
+        common.num_input_tokens = num_tokens
+        common.block_table_tensor = self.runner.input_batch.block_table[gid].get_device_tensor()[:num_reqs]
+        common.slot_mapping = self.runner.input_batch.block_table[gid].slot_mapping.gpu[:num_tokens]
+
+        per_layer: dict[str, Any] = {}
+        for attn_group in self.draft_attn_groups:
+            builder = attn_group.get_metadata_builder()
+            attn_metadata = builder.build(0, common)
+            if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+                attn_metadata.attn_mask = None
+            for layer_name in attn_group.layer_names:
+                per_layer[layer_name] = attn_metadata
+
+        model_kwargs: dict[str, Any] = {
+            "input_ids": self.input_ids[:num_tokens],
+            "positions": self._get_positions(num_tokens),
+            "inputs_embeds": None,
+        }
+        if self.pass_hidden_states_to_model:
+            model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                self.hidden_states[:num_tokens], self._get_positions(num_tokens)
+            )
+            model_kwargs["hidden_states"] = model_hidden_states
+            model_kwargs["positions"] = model_positions
+
+        draft_model = getattr(self.model, "model", None)
+        shared_indices = (
+            self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk")
+        )
+        if shared_indices:
+            draft_model.set_skip_topk(False)
+        try:
+            with set_forward_context(per_layer, self.vllm_config, num_tokens=num_tokens):
+                _EXTRA_CTX.num_tokens = num_tokens
+                _EXTRA_CTX.num_accept_tokens = num_reqs
+                self.model(**model_kwargs)
+        finally:
+            if shared_indices:
+                draft_model.set_skip_topk(True)
+
     def attn_update_stack_num_spec_norm(
         self,
         # `draft_index` must start from `1`, no `0`
@@ -1808,7 +1942,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.decode_token_per_req = 1
             common_attn_metadata.attn_state = (
-                AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill
+                (AscendAttentionState.DecodeOnly if not self.use_cuda_graph else AscendAttentionState.SpecDecoding)
+                if self.method == "mtp"
+                else AscendAttentionState.ChunkedPrefill
             )
             common_attn_metadata.graph_pad_size = -1
             common_attn_metadata.num_input_tokens = input_batch_size

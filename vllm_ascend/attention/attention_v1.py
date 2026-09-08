@@ -65,10 +65,10 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
 
-if vllm_version_is("0.27.1"):
-    from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
-else:
+try:
     from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
+except ImportError:
+    from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -833,6 +833,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         metadata = attn_metadata[draft_step][key]
                         seq_lens = metadata.seq_lens_list
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
+                        # The captured draft block_table is allocated for the
+                        # capture-time batch only (unlike the target runner's
+                        # persistent full-size buffer), so it must always be
+                        # rebound to the current metadata tensor here.
                         block_tables = metadata.block_tables
                         attn_count = attn_count + 1
                         if not metadata.causal:
@@ -1342,6 +1346,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
+        if block_table is None and (
+            not key.is_contiguous() or not value.is_contiguous()
+        ):
+            # Non-PA (TND) FIA requires contiguous key/value; the
+            # qkv-projection split delivers strided slices.
+            key = key.contiguous()
+            value = value.contiguous()
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if (
