@@ -775,7 +775,20 @@ class AscendStep4Model(Step4Model):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if ffn_output is None:
-                hidden_states = layer.input_layernorm(residual)
+                # First layer only: the input norm is not covered by the
+                # fused boundary kernel. For zero-centered norms use the
+                # fused CANN op (scale = weight + 1) instead of the eager
+                # fp32 pow/mean/rsqrt/mul sequence. Input and weight share
+                # the residual/norm dtype here, satisfying the op's
+                # same-dtype constraint.
+                if getattr(layer.input_layernorm, "zero_centered", False):
+                    hidden_states = DeviceOperator.npu_gemma_rms_norm(
+                        residual,
+                        layer.input_layernorm.weight,
+                        layer.input_layernorm.variance_epsilon,
+                    )
+                else:
+                    hidden_states = layer.input_layernorm(residual)
                 hidden_states = layer._cast_for_param_op(hidden_states)
             else:
                 hidden_states, residual = fused_add_rms_norm_cast(
@@ -854,3 +867,19 @@ class AscendStep4ForCausalLM(Step4ForCausalLM):
                 example_layer = layer.moe
                 self.moe_layers.append(layer.moe.experts)
         _set_step4_moe_protocol_metadata(self, example_layer)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.fp32_residual_connection:
+            hidden_states = hidden_states.to(torch.bfloat16)
+        norm = self.model.norm
+        if getattr(norm, "zero_centered", False):
+            # Same-dtype constraint of the fused CANN op: the bf16-rounded
+            # hidden states upcast to fp32 exactly, keeping the fp32 weight
+            # math of the unfused path (verified bitwise-equal to it after
+            # the bf16 output cast).
+            hidden_states = DeviceOperator.npu_gemma_rms_norm(
+                hidden_states.float(), norm.weight, norm.variance_epsilon
+            ).to(torch.bfloat16)
+        else:
+            hidden_states = norm(hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states)
