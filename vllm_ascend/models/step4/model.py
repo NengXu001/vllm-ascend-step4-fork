@@ -29,10 +29,12 @@ from torch.nn.parameter import Parameter
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
+    get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
@@ -51,6 +53,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
@@ -61,6 +64,7 @@ from vllm.models.step4.kernels import (
 )
 from vllm.models.step4.layernorm import OptimusLayerNorm
 from vllm.models.step4.model import (
+    FP32ReplicatedLinear,
     FusedMoEBlock,
     RMSNormFactory,
     Step4Attention,
@@ -72,9 +76,11 @@ from vllm.models.step4.model import (
     Step4SparseIndexerIndexTPLinear,
     _get_step4_moe_layer_indices,
     _is_step4_full_attention_layer,
+    _pad_size_for_groupwise_quant,
     _per_layer_value,
     _require_resolved_valid_vocab_size,
     _set_step4_moe_protocol_metadata,
+    _step4_moe_reduce_policy,
     _step_layer_types,
     _validate_step4_dsa_parallel_geometry,
     get_norm_dtype,
@@ -468,6 +474,188 @@ class AscendStep4DSAAttention(nn.Module, AttentionLayerBase):
         return output_tensor
 
 
+class AscendStep4FusedMoEBlock(FusedMoEBlock):
+    """Step4 MoE block wired to the vllm-ascend fused MoE path.
+
+    Two changes vs the upstream block (mirroring the MiniMax-M3 integration):
+
+    - Router: no ``custom_routing_function``. A custom function forces
+      vllm-ascend's router factory back onto the upstream
+      ``CustomRoutingRouter`` (pure-torch greedy loop). The same semantics
+      (sigmoid scoring, bias used for expert selection only, unbiased
+      weights, renormalization, routed scaling) are expressed with the
+      standard factory arguments so ``AscendFusedTopKRouter`` runs and the
+      fused ``npu_moe_gating_top_k`` gating op is used.
+    - Shared expert: built with ``reduce_results=False`` and handed to
+      ``FusedMoEFactory(shared_experts=...)`` so ``AscendMoERunner`` owns
+      its execution: the shared/routed sum and the TP reductions happen
+      inside the runner, and the shared expert can overlap the routed
+      experts on a separate stream via ``multistream_overlap_shared_expert``.
+      The block's forward returns a single complete tensor instead of a
+      (shared, routed) tuple.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        # Bypass the upstream __init__ entirely: the factory arguments below
+        # are the whole point of this fork. Module and parameter names
+        # (gate, router_bias, share_expert, experts) stay checkpoint
+        # compatible with the upstream block.
+        nn.Module.__init__(self)
+        from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.layer_idx = extract_layer_index(prefix)
+
+        self.ep_size = get_ep_group().device_group.size()
+        self.ep_rank = get_ep_group().device_group.rank()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
+
+        self.hidden_size = config.hidden_size
+        self.enable_eplb = parallel_config.enable_eplb
+        self.n_routed_experts = config.moe_num_experts
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+
+        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
+
+        if self.tp_size > config.moe_num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.moe_num_experts}."
+            )
+
+        self.gate = FP32ReplicatedLinear(
+            config.hidden_size,
+            config.moe_num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
+        )
+        self.use_moe_router_bias = config.use_moe_router_bias
+        if not self.use_moe_router_bias:
+            raise ValueError("Step4 MoE currently requires use_moe_router_bias=true.")
+        self.routed_scaling_factor = config.moe_router_scaling_factor
+        self.router_bias = nn.Parameter(
+            torch.zeros(config.moe_num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.need_fp32_gate = config.need_fp32_gate
+        if not self.need_fp32_gate:
+            raise ValueError(
+                "Step4 MoE requires need_fp32_gate=true for stable router logits."
+            )
+
+        activation = "silu"
+        swiglu_limits = config.swiglu_limits or []
+        swiglu_limit = (
+            swiglu_limits[self.layer_idx]
+            if self.layer_idx < len(swiglu_limits)
+            else None
+        )
+        if swiglu_limit not in (None, 0):
+            swiglu_limit = float(swiglu_limit)
+            if swiglu_limit != 7.0:
+                raise ValueError(
+                    "Step4 fused MoE supports only swiglu_limit=7.0, got "
+                    f"{swiglu_limit}."
+                )
+            activation = "swiglustep"
+
+        share_expert_dim = _pad_size_for_groupwise_quant(
+            config.share_expert_dim, quant_config
+        )
+        moe_intermediate_size = _pad_size_for_groupwise_quant(
+            config.moe_intermediate_size, quant_config
+        )
+        self.fuse_all_reduce, reduce_results = _step4_moe_reduce_policy(
+            self.tp_size,
+            get_dp_group().world_size,
+        )
+        effective_sequence_parallel = (
+            vllm_config.compilation_config.pass_config.enable_sp and self.tp_size > 1
+        )
+
+        # reduce_results=False: AscendMoERunner owns the shared-expert TP
+        # reduction (fused into the token combine for MC2/All2All, or a
+        # separate shared-only all-reduce otherwise).
+        self.share_expert = Step4MLP(
+            config=config,
+            hidden_size=self.hidden_size,
+            intermediate_size=share_expert_dim,
+            hidden_act="silu",
+            reduce_results=False,
+            is_sequence_parallel=effective_sequence_parallel,
+            quant_config=quant_config
+            if quant_config and quant_config.get_name() != "fp8"
+            else None,
+            prefix=f"{prefix}.share_expert",
+        )
+        # No custom_routing_function here: it would disable the Ascend fused
+        # router. scoring_func="sigmoid" + e_score_correction_bias +
+        # renormalize + routed_scaling_factor reproduce router_bias_func
+        # exactly (bias affects expert selection only; weights are the
+        # unbiased sigmoid scores, renormalized and scaled).
+        self.experts = FusedMoEFactory(
+            shared_experts=self.share_expert,
+            num_experts=config.moe_num_experts,
+            top_k=config.moe_top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=moe_intermediate_size,
+            reduce_results=reduce_results,
+            scoring_func="sigmoid",
+            renormalize=config.norm_expert_weight,
+            quant_config=quant_config,
+            activation=activation,
+            prefix=f"{prefix}.experts",
+            e_score_correction_bias=self.router_bias,
+            routed_scaling_factor=config.moe_router_scaling_factor,
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
+            is_sequence_parallel=effective_sequence_parallel,
+            router_logits_dtype=torch.float32,
+        )
+        # Ascend dispatch sizes the global physical expert space from this
+        # metadata (mirrors MiniMaxM3MoE).
+        self.experts.global_redundant_expert_num = self.n_redundant_experts
+        self.experts.moe_config.global_redundant_expert_num = self.n_redundant_experts
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_is_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # Sequence-parallel state is carried by the runner's FusedMoEConfig.
+        if (
+            self.experts.moe_config.is_sequence_parallel
+            and not input_is_sequence_parallel
+        ):
+            hidden_states = sequence_parallel_chunk(hidden_states)
+
+        if self.experts.is_internal_router:
+            # Internal-router runners compute the gate themselves and the
+            # runner sums the shared expert into the routed output.
+            return self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
+        router_logits, _ = self.gate(hidden_states)
+        # Single complete tensor: AscendMoERunner sums the shared expert
+        # output internally and applies the required TP reductions.
+        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+
+
 class AscendStep4DecoderLayer(Step4DecoderLayer):
     """Upstream decoder layer with the attention swapped per layer type.
 
@@ -581,7 +769,7 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
 
         moe_layers_idx = _get_step4_moe_layer_indices(config)
         if layer_idx in moe_layers_idx:
-            self.moe = FusedMoEBlock(
+            self.moe = AscendStep4FusedMoEBlock(
                 vllm_config,
                 prefix=f"{prefix}.moe",
             )
@@ -621,18 +809,19 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
         residual: torch.Tensor | None = None,
         orig_num_tokens: int | None = None,
     ) -> torch.Tensor:
-        if (
-            not self.use_moe
-            or not self.moe.fuse_all_reduce
-            or self.moe.experts.moe_config.is_sequence_parallel
-        ):
+        if not self.use_moe or not isinstance(self.moe, AscendStep4FusedMoEBlock):
             return super()._forward_ffn(
                 hidden_states,
                 input_is_sequence_parallel=input_is_sequence_parallel,
                 residual=residual,
                 orig_num_tokens=orig_num_tokens,
             )
-        shared_output, moe_output = self.moe(
+        # AscendStep4FusedMoEBlock returns a single complete tensor: the
+        # Ascend MoE combine kernel reduces the routed output across TP and
+        # the runner reduces the shared-expert output to match, so no extra
+        # all-reduce may be applied here (reducing the sum would count the
+        # routed contribution once per TP rank, measured 8x).
+        ffn_output = self.moe(
             hidden_states, input_is_sequence_parallel=input_is_sequence_parallel
         )
         # On Ascend the MoE comm impls (MC2 / AllGather / All2All) fuse the
@@ -643,13 +832,21 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
         # with reduce_results=False) is partial w.r.t. TP: reduce it alone,
         # then add the complete routed output. Reducing the sum instead would
         # count the routed contribution once per TP rank (measured 8x).
-        shared_output = self._cast_for_residual(shared_output)
-        moe_output = self._cast_for_residual(moe_output)
-        if self.use_fused_all_reduce:
-            shared_output = self.tp_group.all_reduce(shared_output)
-        else:
-            shared_output = tensor_model_parallel_all_reduce(shared_output)
-        return moe_output + shared_output
+        if self.moe.experts.moe_config.is_sequence_parallel:
+            # Sequence-parallel outputs are token shards; all-gather like
+            # the upstream layer does for the (shared, routed) tuple.
+            if input_is_sequence_parallel:
+                assert residual is not None
+                assert orig_num_tokens is not None
+                gathered = tensor_model_parallel_all_gather(
+                    self._cast_for_residual(ffn_output) + residual, dim=0
+                )
+                return gathered[:orig_num_tokens]
+            gathered = tensor_model_parallel_all_gather(
+                self._cast_for_residual(ffn_output), dim=0
+            )
+            return gathered[: hidden_states.shape[0]]
+        return self._cast_for_residual(ffn_output)
 
 
 
