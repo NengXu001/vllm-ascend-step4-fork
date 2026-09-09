@@ -86,6 +86,7 @@ from vllm_ascend.models.step4.dsa_attention import (
     AscendStep4DSABackend,
     AscendStep4DSAImpl,
 )
+from vllm_ascend.models.step4.fused_add_rms_norm import fused_add_rms_norm_cast
 
 logger = init_logger(__name__)
 
@@ -650,6 +651,37 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
         else:
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return moe_output + shared_output
+
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        # The reduce-scatter path needs the sequence-parallel-chunked residual
+        # before the norm, which the fused kernel does not cover; keep the
+        # upstream sequence there. (This layer never enables it on Ascend.)
+        if self.use_attention_o_proj_reduce_scatter and hidden_states.dim() == 2:
+            return super().forward(positions, hidden_states)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self._cast_for_param_op(hidden_states)
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        hidden_states, residual = fused_add_rms_norm_cast(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+            zero_centered=getattr(
+                self.post_attention_layernorm, "zero_centered", False
+            ),
+            fp32_residual=self.fp32_residual_connection,
+        )
+
+        ffn_output = self._forward_ffn(hidden_states)
+        ffn_output = self._cast_for_residual(ffn_output)
+        return ffn_output + residual
 
 
 
