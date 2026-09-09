@@ -52,6 +52,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm.models.step4.kernels import (
@@ -652,6 +653,33 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return moe_output + shared_output
 
+    def forward_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """self_attn + fused post-attention residual-add/RMSNorm/cast.
+
+        Takes the normed hidden states (param-op dtype) and the running
+        residual (residual dtype), returns the post-attention normed hidden
+        states and the updated residual.
+        """
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        return fused_add_rms_norm_cast(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+            zero_centered=getattr(
+                self.post_attention_layernorm, "zero_centered", False
+            ),
+            fp32_residual=self.fp32_residual_connection,
+        )
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -664,19 +692,8 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-        hidden_states, residual = fused_add_rms_norm_cast(
-            hidden_states,
-            residual,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
-            zero_centered=getattr(
-                self.post_attention_layernorm, "zero_centered", False
-            ),
-            fp32_residual=self.fp32_residual_connection,
+        hidden_states, residual = self.forward_attention(
+            positions, hidden_states, residual
         )
 
         ffn_output = self._forward_ffn(hidden_states)
@@ -732,6 +749,59 @@ class AscendStep4Model(Step4Model):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+        residual = self._cast_for_residual(hidden_states)
+
+        # The per-layer tail (cast the FFN output to the residual dtype and
+        # add the residual) is deferred and fused with the *next* layer's
+        # input RMSNorm + param-op cast in one kernel, so each layer
+        # boundary costs a single fused launch instead of five.
+        ffn_output: torch.Tensor | None = None
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            if ffn_output is None:
+                hidden_states = layer.input_layernorm(residual)
+                hidden_states = layer._cast_for_param_op(hidden_states)
+            else:
+                hidden_states, residual = fused_add_rms_norm_cast(
+                    ffn_output,
+                    residual,
+                    layer.input_layernorm.weight,
+                    layer.input_layernorm.variance_epsilon,
+                    zero_centered=getattr(
+                        layer.input_layernorm, "zero_centered", False
+                    ),
+                    fp32_residual=self.fp32_residual_connection,
+                )
+            hidden_states, residual = layer.forward_attention(
+                positions, hidden_states, residual
+            )
+            ffn_output = layer._forward_ffn(hidden_states)
+        hidden_states = self._cast_for_residual(ffn_output) + residual
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                }
+            )
+
+        return hidden_states
 
 
 class AscendStep4ForCausalLM(Step4ForCausalLM):
