@@ -20,6 +20,8 @@ cores follows ``vllm_ascend.ops.triton.rms_norm``.
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+
 
 @triton.jit(do_not_specialize=["total_rows"])
 def _fused_add_rms_norm_cast_kernel(
@@ -123,10 +125,7 @@ def fused_add_rms_norm_cast(
     if total_rows == 0:
         return out.view(x.shape), residual_out.view(x.shape)
 
-    device_properties = triton.runtime.driver.active.utils.get_device_properties(
-        x.device
-    )
-    num_vectorcore = device_properties.get("num_vectorcore", 0)
+    num_vectorcore = get_vectorcore_num()
     grid = (max(1, min(num_vectorcore, total_rows)),)
 
     block_n = triton.next_power_of_2(hidden_size)
