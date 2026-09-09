@@ -55,6 +55,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm.models.step4.kernels import (
@@ -92,6 +93,7 @@ from vllm_ascend.models.step4.dsa_attention import (
     AscendStep4DSABackend,
     AscendStep4DSAImpl,
 )
+from vllm_ascend.models.step4.fused_add_rms_norm import fused_add_rms_norm_cast
 
 logger = init_logger(__name__)
 
@@ -848,6 +850,53 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             return gathered[: hidden_states.shape[0]]
         return self._cast_for_residual(ffn_output)
 
+    def forward_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """self_attn + fused post-attention residual-add/RMSNorm/cast.
+
+        Takes the normed hidden states (param-op dtype) and the running
+        residual (residual dtype), returns the post-attention normed hidden
+        states and the updated residual.
+        """
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        return fused_add_rms_norm_cast(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+            zero_centered=getattr(
+                self.post_attention_layernorm, "zero_centered", False
+            ),
+            fp32_residual=self.fp32_residual_connection,
+        )
+
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        # The reduce-scatter path needs the sequence-parallel-chunked residual
+        # before the norm, which the fused kernel does not cover; keep the
+        # upstream sequence there. (This layer never enables it on Ascend.)
+        if self.use_attention_o_proj_reduce_scatter and hidden_states.dim() == 2:
+            return super().forward(positions, hidden_states)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self._cast_for_param_op(hidden_states)
+
+        hidden_states, residual = self.forward_attention(
+            positions, hidden_states, residual
+        )
+
+        ffn_output = self._forward_ffn(hidden_states)
+        ffn_output = self._cast_for_residual(ffn_output)
+        return ffn_output + residual
+
 
 
 class AscendStep4Model(Step4Model):
@@ -897,6 +946,72 @@ class AscendStep4Model(Step4Model):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+        residual = self._cast_for_residual(hidden_states)
+
+        # The per-layer tail (cast the FFN output to the residual dtype and
+        # add the residual) is deferred and fused with the *next* layer's
+        # input RMSNorm + param-op cast in one kernel, so each layer
+        # boundary costs a single fused launch instead of five.
+        ffn_output: torch.Tensor | None = None
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            if ffn_output is None:
+                # First layer only: the input norm is not covered by the
+                # fused boundary kernel. For zero-centered norms use the
+                # fused CANN op (scale = weight + 1) instead of the eager
+                # fp32 pow/mean/rsqrt/mul sequence. Input and weight share
+                # the residual/norm dtype here, satisfying the op's
+                # same-dtype constraint.
+                if getattr(layer.input_layernorm, "zero_centered", False):
+                    hidden_states = DeviceOperator.npu_gemma_rms_norm(
+                        residual,
+                        layer.input_layernorm.weight,
+                        layer.input_layernorm.variance_epsilon,
+                    )
+                else:
+                    hidden_states = layer.input_layernorm(residual)
+                hidden_states = layer._cast_for_param_op(hidden_states)
+            else:
+                hidden_states, residual = fused_add_rms_norm_cast(
+                    ffn_output,
+                    residual,
+                    layer.input_layernorm.weight,
+                    layer.input_layernorm.variance_epsilon,
+                    zero_centered=getattr(
+                        layer.input_layernorm, "zero_centered", False
+                    ),
+                    fp32_residual=self.fp32_residual_connection,
+                )
+            hidden_states, residual = layer.forward_attention(
+                positions, hidden_states, residual
+            )
+            ffn_output = layer._forward_ffn(hidden_states)
+        hidden_states = self._cast_for_residual(ffn_output) + residual
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                }
+            )
+
+        return hidden_states
 
 
 class AscendStep4ForCausalLM(Step4ForCausalLM):
@@ -949,3 +1064,19 @@ class AscendStep4ForCausalLM(Step4ForCausalLM):
                 example_layer = layer.moe
                 self.moe_layers.append(layer.moe.experts)
         _set_step4_moe_protocol_metadata(self, example_layer)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.fp32_residual_connection:
+            hidden_states = hidden_states.to(torch.bfloat16)
+        norm = self.model.norm
+        if getattr(norm, "zero_centered", False):
+            # Same-dtype constraint of the fused CANN op: the bf16-rounded
+            # hidden states upcast to fp32 exactly, keeping the fp32 weight
+            # math of the unfused path (verified bitwise-equal to it after
+            # the bf16 output cast).
+            hidden_states = DeviceOperator.npu_gemma_rms_norm(
+                hidden_states.float(), norm.weight, norm.variance_epsilon
+            ).to(torch.bfloat16)
+        else:
+            hidden_states = norm(hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states)
