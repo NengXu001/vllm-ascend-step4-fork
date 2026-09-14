@@ -641,6 +641,173 @@ def quant_apply_mlp(
     return hidden_states, before_gmm2_evt
 
 
+def fp8_block_apply_mlp(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    activation: MoEActivation | str,
+) -> torch.Tensor:
+    """Block-fp8 (128x128 ``weight_scale_inv``) expert MLP on the sorted layout.
+
+    Consumes the dispatcher's expert-sorted ``hidden_states`` with the
+    per-expert ``group_list`` intervals. Two execution paths, chosen by the
+    weight layout ``Step4Fp8BlockFusedMoEMethod.process_weights_after_loading``
+    left on the tensors:
+
+    * aclnn fast path (K-major weights, needs the packaged custom op): the
+      whole sorted batch goes through ``_C_ascend.grouped_matmul_block_fp8``
+      (aclnnGroupedMatmulV5 G-B scenario: e4m3 weights + fp32 128x128 block
+      scales + fp32 per-token-per-128-group activation scales), once per
+      projection, with the vendored ``act_quant`` producing the activation
+      scales. Fully device-side (no host round-trips), so it is capturable
+      by NPU graphs.
+    * triton fallback (checkpoint layout): per expert, the vendored step4-hf
+      kernel pair -- dynamic per-128-group e4m3 activation quantization plus
+      the block-scaled fp8 GEMM (scales folded after the fp32 dot). Host
+      counts per expert, so it is not NPU-graph capturable (eager fallback).
+
+    ``swiglustep`` applies the fp32 clamps with a single rounding back to
+    bf16; the limit is fixed at 7.0 (the only value the Step4 model accepts).
+    """
+    # Lazy import: the kernels live under models/step4 and must not cycle
+    # the quantization package at module import time.
+    from vllm_ascend.models.step4.fp8_kernels import act_quant
+
+    num_experts, packed_intermediate, _ = w1.shape
+    intermediate = packed_intermediate // 2
+
+    x_bf = hidden_states if hidden_states.dtype == torch.bfloat16 else hidden_states.to(torch.bfloat16)
+
+    # K-major marker: the hidden size appears as w1's K dim and w2's N dim
+    # while w2's K dim is w1's N dim halved (checkpoint layout has the hidden
+    # size as w1's N dim and w2's K dim instead).
+    if w1.shape[1] == w2.shape[2] and 2 * w2.shape[1] == w1.shape[2]:
+        group_prefix = _fp8_block_group_prefix(group_list, group_list_type, num_experts)
+        return _fp8_block_apply_mlp_aclnn(x_bf, w1, w1_scale, w2, w2_scale, group_prefix, activation, act_quant)
+
+    # group_list conventions: type 0 = per-expert prefix sums (MC2), type 1 =
+    # per-expert token counts (AllGather). Rows of ``hidden_states`` are the
+    # per-expert intervals of the local experts, in local-expert order.
+    if group_list_type == 0:
+        prefix = group_list.tolist()
+        counts = [prefix[0]] + [prefix[i] - prefix[i - 1] for i in range(1, len(prefix))]
+    elif group_list_type == 1:
+        counts = group_list.tolist()
+    else:
+        raise NotImplementedError(f"fp8_block_apply_mlp does not support group_list_type={group_list_type}.")
+    if len(counts) != num_experts:
+        # AllGather's init_routing reports one count per *global* expert; the
+        # sorted rows cover only this rank's contiguous local range (linear
+        # placement), so window the counts to it.
+        from vllm.distributed import get_ep_group
+
+        first_local = get_ep_group().rank_in_group * num_experts
+        counts = counts[first_local : first_local + num_experts]
+
+    return _fp8_block_apply_mlp_triton(x_bf, w1, w1_scale, w2, w2_scale, counts, intermediate, activation, act_quant)
+
+
+def _fp8_block_group_prefix(group_list: torch.Tensor, group_list_type: int, num_experts: int) -> torch.Tensor:
+    """Per-local-expert prefix sums (int64) built entirely on device.
+
+    Capture-safe: only shape queries, static slicing and device kernels --
+    no ``.tolist()`` D2H sync and no ``torch.tensor(...)`` H2D copy, both of
+    which are illegal inside an NPU-graph capture region.
+
+    group_list conventions: type 0 = per-expert prefix sums (MC2, already
+    local), type 1 = per-expert token counts (AllGather, possibly one entry
+    per *global* expert, windowed to this rank's contiguous local range).
+    """
+    counts = group_list
+    if group_list_type == 0:
+        counts = torch.diff(counts, prepend=torch.zeros(1, dtype=counts.dtype, device=counts.device))
+    if counts.numel() > num_experts:
+        from vllm.distributed import get_ep_group
+
+        first_local = get_ep_group().rank_in_group * num_experts
+        counts = counts[first_local : first_local + num_experts]
+    # aclnnGroupedMatmulV5 requires an int64 groupList; cumsum already
+    # promotes to int64.
+    return torch.cumsum(counts, dim=0)
+
+
+def _fp8_block_apply_mlp_aclnn(
+    x_bf: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_prefix: torch.Tensor,
+    activation: MoEActivation | str,
+    act_quant,
+) -> tuple[torch.Tensor, None]:
+    """Whole-batch block-fp8 expert MLP through aclnnGroupedMatmulV5.
+
+    ``group_prefix`` holds the per-local-expert prefix sums (int32) already
+    built on device (see ``_fp8_block_group_prefix``); everything here is
+    async device work, so the whole path is NPU-graph capturable.
+    """
+    from vllm_ascend.ops.grouped_matmul_v5 import grouped_matmul_block_fp8
+
+    if x_bf.shape[0] == 0:
+        return torch.zeros(0, w2.shape[2], dtype=torch.bfloat16, device=x_bf.device), None
+
+    x_fp8, x_scale = act_quant(x_bf)
+    gate_up = grouped_matmul_block_fp8([x_fp8], [w1], [w1_scale], [x_scale], group_prefix)[0]
+    gate, up = gate_up[:, : gate_up.shape[1] // 2], gate_up[:, gate_up.shape[1] // 2 :]
+    if str(activation) in ("swiglustep", "MoEActivation.SWIGLUSTEP"):
+        activated = torch.nn.functional.silu(gate.float()).clamp(max=7.0)
+        bounded = up.float().clamp(-7.0, 7.0)
+        hidden = (activated * bounded).to(gate.dtype)
+    else:
+        hidden = (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+    h_fp8, h_scale = act_quant(hidden)
+    out = grouped_matmul_block_fp8([h_fp8], [w2], [w2_scale], [h_scale], group_prefix)[0]
+    # Contract of unified_apply_mlp's quant path: (output, before_gmm2 event).
+    return out, None
+
+
+def _fp8_block_apply_mlp_triton(
+    x_bf: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    counts: list[int],
+    intermediate: int,
+    activation: MoEActivation | str,
+    act_quant,
+) -> tuple[torch.Tensor, None]:
+    """Per-expert block-fp8 expert MLP through the vendored triton kernels."""
+    from vllm_ascend.models.step4.fp8_kernels import fp8_gemm
+
+    out = torch.zeros(x_bf.shape[0], w2.shape[1], dtype=torch.bfloat16, device=x_bf.device)
+    start = 0
+    for expert in range(len(counts)):
+        count = counts[expert]
+        if count == 0:
+            continue
+        tokens = x_bf[start : start + count]
+        x_fp8, x_scale = act_quant(tokens)
+        gate_up = fp8_gemm(x_fp8, x_scale, w1[expert], w1_scale[expert])
+        gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]
+        if str(activation) in ("swiglustep", "MoEActivation.SWIGLUSTEP"):
+            activated = torch.nn.functional.silu(gate.float()).clamp(max=7.0)
+            bounded = up.float().clamp(-7.0, 7.0)
+            hidden = (activated * bounded).to(gate.dtype)
+        else:
+            hidden = (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+        h_fp8, h_scale = act_quant(hidden)
+        out[start : start + count] = fp8_gemm(h_fp8, h_scale, w2[expert], w2_scale[expert])
+        start += count
+    # Contract of unified_apply_mlp's quant path: (output, before_gmm2 event).
+    return out, None
+
+
 def unquant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -795,6 +962,18 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     swiglu_beta = mlp_compute_input.swiglu_beta
     activation_situ_beta = mlp_compute_input.activation_situ_beta
     activation_situ_linear_beta = mlp_compute_input.activation_situ_linear_beta
+
+    if mlp_compute_input.quant.quant_type == QuantType.FP8_BLOCK:
+        return fp8_block_apply_mlp(
+            hidden_states=hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            activation=activation,
+        )
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
