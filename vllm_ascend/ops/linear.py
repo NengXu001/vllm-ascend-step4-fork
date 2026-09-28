@@ -22,9 +22,12 @@ AscendRowParallelLinear and AscendColumnParallelLinear.
 
 import torch
 import torch.nn as nn
+import torch_npu
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -40,12 +43,19 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.device.hardware_profile import HardwareCapability, WeightLayoutPolicy, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    HardwareCapability,
+    WeightLayoutPolicy,
+    get_current_hardware_profile,
+)
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.quantization.tp_weight_switch import TPWeightGatherSpec, TPWeightSwitchMixin
 from vllm_ascend.utils import (
+    ACL_FORMAT_FRACTAL_ND,
     maybe_trans_nz,
 )
+
+logger = init_logger(__name__)
 
 
 def unquantized_gemm(
@@ -352,11 +362,104 @@ class AscendRowParallelLinear(RowParallelLinear):
         if self.custom_op is not None:
             self.custom_op.update_attrs()
 
+        # Lazy state for the fused mm + reduce-scatter path
+        # (npu_mm_reduce_scatter_base), used by the sequence-parallel
+        # reduce_scatter_results branch below. _mmrs_weight holds an ND
+        # (k, n) view of the weight: the fused kernel's comm_mode="ai_cpu"
+        # (A5) rejects NZ, and passing ND keeps both adaptor families on one
+        # code path. None until first use; _mmrs_unavailable latches a
+        # permanent fallback to the two-step GEMM + reduce-scatter.
+        self._mmrs_hcom: str | None = None
+        self._mmrs_weight: torch.Tensor | None = None
+        self._mmrs_unavailable = False
+
+    def _mmrs_fusion_ready(self) -> bool:
+        """Lazily resolve the TP-group hcom name and the ND transposed weight.
+
+        Returns True when the fused kernel can serve this layer; any failure
+        latches _mmrs_unavailable so the caller falls back to the two-step
+        GEMM + reduce-scatter permanently.
+        """
+        if self._mmrs_unavailable:
+            return False
+        if self._mmrs_weight is not None:
+            return True
+        try:
+            from vllm.distributed import get_tp_group
+
+            device_group = get_tp_group().device_group
+            rank = torch.distributed.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self._mmrs_hcom = backend.get_hccl_comm_name(rank)
+            weight = self.weight.data
+            self._mmrs_weight = weight.t()
+        except Exception as e:  # noqa: BLE001 - degrade to two-step path
+            logger.warning_once(
+                "mm_reduce_scatter fusion unavailable for %s (%s); falling back to GEMM + reduce_scatter.",
+                self.prefix,
+                e,
+            )
+            self._mmrs_unavailable = True
+            return False
+        return True
+
+    def _use_mmrs_fusion(self, input_parallel: torch.Tensor) -> bool:
+        """Runtime gate: forward-context switch plus input shape contract."""
+        try:
+            # get_forward_context() asserts outside set_forward_context (UTs);
+            # no context means the mmrs_fusion switch is unavailable.
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return (
+            getattr(forward_context, "mmrs_fusion", False)
+            and input_parallel.dim() == 2
+            and input_parallel.shape[0] % self.tp_size == 0
+            and self._mmrs_fusion_ready()
+        )
+
     def forward(
         self,
         input_,
+        reduce_scatter_results: bool = False,
+        reduce_scatter_dim: int = 0,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if reduce_scatter_results:
+            # Sequence-parallel contract: compute the row-parallel partial and
+            # reduce-scatter it across TP instead of all-reducing (half the
+            # communication volume). Callers pad rows to a TP multiple.
+            if self.custom_op is not None:
+                raise NotImplementedError("reduce_scatter_results is not supported with custom ops")
+            if not self.reduce_results:
+                raise ValueError("reduce_scatter_results requires reduce_results=True")
+            from vllm.distributed import split_tensor_along_last_dim, tensor_model_parallel_reduce_scatter
+
+            if self.input_is_parallel:
+                input_parallel = input_
+            else:
+                input_parallel = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)[
+                    self.tp_rank
+                ].contiguous()
+            if reduce_scatter_dim == 0 and self._use_mmrs_fusion(input_parallel):
+                # Fused mm + reduce-scatter: the kernel overlaps GEMM with the
+                # communication internally and returns the (m/tp, n) shard.
+                from vllm_ascend.device.device_op import DeviceOperator
+
+                output = DeviceOperator.npu_mm_reduce_scatter_base(
+                    input_parallel.contiguous(), self._mmrs_weight, self._mmrs_hcom, self.tp_size
+                )
+            else:
+                bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+                if self.tp_size > 1:
+                    output = tensor_model_parallel_reduce_scatter(output_parallel, reduce_scatter_dim)
+                else:
+                    output = output_parallel
+            output_bias = self.bias if self.skip_bias_add else None
+            if not self.return_bias:
+                return output
+            return output, output_bias
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
